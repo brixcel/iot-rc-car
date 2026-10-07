@@ -89,12 +89,29 @@ void setup() {
   tone(PIN_BUZZER, 1000, 100);
   delay(150);
   tone(PIN_BUZZER, 1500, 150);
+
+  // Self-Test: 400ms motor pulse to visually verify battery & L298N are working
+  Serial.println(F("[HARDWARE CHECK]: Pulsing motors forward for 400ms..."));
+  digitalWrite(PIN_IN1, HIGH);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, HIGH);
+  digitalWrite(PIN_IN4, LOW);
+  delay(400);
+  stopMotors();
+  Serial.println(F("[HARDWARE CHECK]: Pulse complete. Ready for NodeMCU commands."));
 }
 
 void loop() {
   // 1. Read incoming commands from NodeMCU via SoftwareSerial
   while (nodeSerial.available() > 0) {
     char c = (char)nodeSerial.read();
+    // Debug echo: show exact bytes arriving from NodeMCU
+    Serial.print(F("[LINK RX]: '"));
+    Serial.print(c);
+    Serial.print(F("' (0x"));
+    Serial.print((byte)c, HEX);
+    Serial.println(F(")"));
+
     if (c == '\n' || c == '\r') {
       if (rxBuffer.length() > 0) {
         processCommand(rxBuffer);

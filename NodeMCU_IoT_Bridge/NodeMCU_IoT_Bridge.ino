@@ -62,8 +62,9 @@ const unsigned long AUTO_STOP_TIMEOUT = 1500; // ms: Stops car if no command wit
 // Non-blocking reconnect timers
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastTelemetryTime = 0;
+unsigned long lastWiFiCheckTime = 0;
 
-// LED Indicator (NodeMCU onboard LED is active LOW)
+// LED Indicator (NodeMCU onboard LED is active LOW: LOW = ON, HIGH = OFF)
 const int PIN_LED = LED_BUILTIN; // GPIO 2 (D4)
 
 // --- FORWARD DECLARATIONS ---
@@ -87,7 +88,7 @@ void setup() {
   unoSerial.begin(9600);
   Serial.println(F("[SERIAL]: SoftwareSerial active on D1(TX)->Uno(2) and D2(RX)->Uno(3) at 9600 baud"));
 
-  // Connect to Follower's Mobile Hotspot
+  // Connect to Follower's Mobile Hotspot with robust reconnection settings
   setupWiFi();
 
   // Configure MQTT Cloud Client
@@ -101,17 +102,27 @@ void setup() {
 }
 
 void loop() {
-  // 1. Maintain Wi-Fi Connection
+  unsigned long now = millis();
+
+  // 1. Maintain Wi-Fi Connection (Smooth background auto-reconnect)
   if (WiFi.status() != WL_CONNECTED) {
-    digitalWrite(PIN_LED, HIGH);
-    setupWiFi();
+    // Fast blink LED to visibly show it is searching for hotspot
+    digitalWrite(PIN_LED, (now % 400 < 200) ? LOW : HIGH);
+
+    if (now - lastWiFiCheckTime > 8000) {
+      lastWiFiCheckTime = now;
+      Serial.println(F("[WIFI]: Searching / reconnecting to hotspot..."));
+      WiFi.reconnect();
+    }
+    return; // Don't try MQTT while Wi-Fi is down
   }
 
   // 2. Maintain MQTT Cloud Connection (Non-blocking reconnect)
   if (!mqttClient.connected()) {
-    digitalWrite(PIN_LED, HIGH);
-    unsigned long now = millis();
-    if (now - lastReconnectAttempt > 5000) {
+    // Slow blink LED to show Wi-Fi is connected but waiting for MQTT Cloud
+    digitalWrite(PIN_LED, (now % 1000 < 500) ? LOW : HIGH);
+
+    if (now - lastReconnectAttempt > 4000) {
       lastReconnectAttempt = now;
       if (reconnectMQTT()) {
         lastReconnectAttempt = 0;
@@ -120,21 +131,21 @@ void loop() {
   } else {
     // Process incoming MQTT messages
     mqttClient.loop();
-    digitalWrite(PIN_LED, LOW); // LED ON indicates healthy Cloud connection
+    digitalWrite(PIN_LED, LOW); // Solid blue LED = 100% HEALTHY CLOUD LINK
   }
 
   // 3. Watchdog Failsafe: Auto-stop car if signal was lost while moving
-  if (carIsActive && (millis() - lastCommandTime > AUTO_STOP_TIMEOUT)) {
+  if (carIsActive && (now - lastCommandTime > AUTO_STOP_TIMEOUT)) {
     Serial.println(F("[WATCHDOG]: Command stream timeout! Stopping RC Car."));
     unoSerial.println("S:0");
     carIsActive = false;
   }
 
   // 4. Send Periodic Telemetry/Heartbeat to Cloud (Every 3 seconds)
-  if (millis() - lastTelemetryTime > 3000) {
-    lastTelemetryTime = millis();
+  if (now - lastTelemetryTime > 3000) {
+    lastTelemetryTime = now;
     if (mqttClient.connected()) {
-      String json = "{\"status\":\"ONLINE\",\"rssi\":" + String(WiFi.RSSI()) + ",\"uptime\":" + String(millis() / 1000) + "}";
+      String json = "{\"status\":\"ONLINE\",\"rssi\":" + String(WiFi.RSSI()) + ",\"uptime\":" + String(now / 1000) + "}";
       mqttClient.publish(TOPIC_STATUS, json.c_str());
     }
   }
@@ -152,14 +163,19 @@ void setupWiFi() {
   Serial.print(F("[WIFI]: Connecting to Hotspot: "));
   Serial.println(WIFI_SSID);
 
+  WiFi.persistent(false);          // Prevent flash wear and stale cached configs
+  WiFi.disconnect(true);           // Clear old state
+  delay(100);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);     // Let ESP8266 radio auto-reconnect in hardware
+  WiFi.setSleepMode(WIFI_NONE_SLEEP); // Disable power save sleep (keeps Wi-Fi always awake)
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 25) {
-    delay(400);
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(300);
     Serial.print(F("."));
-    digitalWrite(PIN_LED, !digitalRead(PIN_LED)); // Blink while connecting
+    digitalWrite(PIN_LED, (attempts % 2 == 0) ? LOW : HIGH); // Blink while connecting
     attempts++;
   }
 
@@ -172,7 +188,7 @@ void setupWiFi() {
     Serial.println(F(" dBm"));
   } else {
     Serial.println();
-    Serial.println(F("[WIFI]: Connection pending... will retry in loop."));
+    Serial.println(F("[WIFI]: Initial connection timeout. Background auto-reconnect armed."));
   }
 }
 
@@ -219,6 +235,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   // Send packet directly to Arduino Uno via SoftwareSerial!
   // e.g., "F:200\n", "S:0\n", "V:100:0:200\n", "LIGHT:1\n", "HORN:1\n"
   unoSerial.println(msg);
+  unoSerial.flush();
 
   lastCommandTime = millis();
   // If direction is not Stop ('S'), mark car as actively moving

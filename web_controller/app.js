@@ -165,6 +165,17 @@ let mqttConnected = false;
 const pendingPings = new Map();
 let pingSeq = 0;
 let lastPongTime = 0;
+// Broker-only round trip (cockpit -> broker -> cockpit, no car involved)
+const pendingEchoes = new Map();
+let echoTopic = '';
+let carRtt = null;
+let brokerRtt = null;
+
+function renderLatency() {
+  const car = carRtt === null ? '--' : carRtt;
+  const net = brokerRtt === null ? '--' : brokerRtt;
+  pingVal.textContent = `CAR ${car} | NET ${net} ms`;
+}
 
 function initMQTT() {
   if (typeof Paho === 'undefined') {
@@ -183,6 +194,7 @@ function initMQTT() {
   connBadge.style.color = '#ffb300';
 
   mqttClient = new Paho.MQTT.Client(state.mqttBroker, Number(state.mqttPort), state.mqttPath, clientId);
+  echoTopic = `${state.mqttTopic}/echo/${clientId}`;
 
   mqttClient.onConnectionLost = (responseObject) => {
     mqttConnected = false;
@@ -211,8 +223,16 @@ function initMQTT() {
       if (sentAt !== undefined) {
         pendingPings.delete(payload);
         lastPongTime = performance.now();
-        pingVal.textContent = `${Math.round(lastPongTime - sentAt)} ms`;
+        carRtt = Math.round(lastPongTime - sentAt);
+        renderLatency();
         state.isConnected = true;
+      }
+    } else if (topic === echoTopic) {
+      const sentAt = pendingEchoes.get(payload);
+      if (sentAt !== undefined) {
+        pendingEchoes.delete(payload);
+        brokerRtt = Math.round(performance.now() - sentAt);
+        renderLatency();
       }
     }
   };
@@ -227,13 +247,16 @@ function initMQTT() {
       state.isConnected = true;
       connText.textContent = 'CLOUD READY';
       connBadge.style.color = '#00f2fe';
-      pingVal.textContent = '0 ms';
+      carRtt = null;
+      brokerRtt = null;
+      renderLatency();
       console.log('[MQTT]: Connected successfully to HiveMQ Cloud!');
 
       // Subscribe to telemetry/status topic from car
       const statusTopic = `${state.mqttTopic}/status`;
       mqttClient.subscribe(statusTopic);
       mqttClient.subscribe(`${state.mqttTopic}/pong`);
+      mqttClient.subscribe(echoTopic);
       console.log(`[MQTT]: Subscribed to ${statusTopic} and /pong`);
     },
     onFailure: (err) => {
@@ -687,8 +710,12 @@ setInterval(() => {
   for (const [id, sentAt] of pendingPings) {
     if (now - sentAt > 5000) pendingPings.delete(id);
   }
+  for (const [id, sentAt] of pendingEchoes) {
+    if (now - sentAt > 5000) pendingEchoes.delete(id);
+  }
   if (lastPongTime > 0 && now - lastPongTime > 5000) {
-    pingVal.textContent = 'NO CAR';
+    carRtt = 'NO CAR';
+    renderLatency();
   }
 
   const id = String(++pingSeq);
@@ -698,6 +725,12 @@ setInterval(() => {
     message.qos = 0;
     pendingPings.set(id, now);
     mqttClient.send(message);
+
+    const echo = new Paho.MQTT.Message(id);
+    echo.destinationName = echoTopic;
+    echo.qos = 0;
+    pendingEchoes.set(id, now);
+    mqttClient.send(echo);
   } catch (e) {}
 }, 1000);
 

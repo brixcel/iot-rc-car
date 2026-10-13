@@ -221,8 +221,18 @@
 
         <div class="setting-group" id="group-mqtt-broker">
           <label for="input-mqtt-broker">MQTT Cloud Broker</label>
-          <input type="text" id="input-mqtt-broker" value="broker.hivemq.com" placeholder="broker.hivemq.com">
-          <small>Free public cloud broker: broker.hivemq.com (WSS Port 8884)</small>
+          <input type="text" id="input-mqtt-broker" value="n345137a.ala.asia-southeast1.emqxsl.com" placeholder="n345137a.ala.asia-southeast1.emqxsl.com">
+          <small>Broker host only, no https:// or port</small>
+        </div>
+
+        <div class="setting-group" id="group-mqtt-auth">
+          <label for="input-mqtt-port">WebSocket TLS Port</label>
+          <input type="number" id="input-mqtt-port" value="8084" placeholder="8084">
+          <label for="input-mqtt-user">Username</label>
+          <input type="text" id="input-mqtt-user" autocomplete="off" placeholder="(none for public broker)">
+          <label for="input-mqtt-pass">Password</label>
+          <input type="password" id="input-mqtt-pass" autocomplete="off" placeholder="(none for public broker)">
+          <small>Saved only in this browser, never uploaded with the app.</small>
         </div>
 
         <div class="setting-group" id="group-http-ip" style="display: none;">

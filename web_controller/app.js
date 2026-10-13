@@ -6,8 +6,8 @@
 // STATE
 const state = {
   connMode: 'mqtt', // 'mqtt' (Cloud IoT) or 'http' (Local Direct Wi-Fi)
-  mqttBroker: 'broker.hivemq.com',
-  mqttPort: 8884, // WSS port for broker.hivemq.com
+  mqttBroker: 'n345137a.ala.asia-southeast1.emqxsl.com', // EMQX Serverless, Singapore
+  mqttPort: 8084, // WebSocket over TLS
   mqttPath: '/mqtt',
   mqttTopic: 'cyber_rc_car',
   targetIp: window.location.hostname && window.location.hostname !== 'localhost' && window.location.hostname !== '' 
@@ -18,6 +18,8 @@ const state = {
   activeGear: 'NEUTRAL',
   lightsOn: false,
   hornOn: false,
+  mqttUser: '',
+  mqttPass: '',
   pollRate: 100, // ms
   hapticsEnabled: true,
   soundEnabled: true,
@@ -27,6 +29,28 @@ const state = {
   lastSendTime: 0,
   streamTimer: null,
 };
+
+// BROKER SETTINGS PERSISTENCE (credentials stay in this browser only)
+const BROKER_KEYS = ['mqttBroker', 'mqttPort', 'mqttTopic', 'mqttUser', 'mqttPass'];
+
+function loadBrokerSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('cyberRcBroker') || '{}');
+    BROKER_KEYS.forEach((k) => {
+      if (saved[k] !== undefined && saved[k] !== '') state[k] = saved[k];
+    });
+  } catch (e) {}
+}
+
+function saveBrokerSettings() {
+  try {
+    const out = {};
+    BROKER_KEYS.forEach((k) => { out[k] = state[k]; });
+    localStorage.setItem('cyberRcBroker', JSON.stringify(out));
+  } catch (e) {}
+}
+
+loadBrokerSettings();
 
 // AUDIO SYNTHESIZER (Pure Web Audio API - no external assets)
 let audioCtx = null;
@@ -237,7 +261,7 @@ function initMQTT() {
     }
   };
 
-  mqttClient.connect({
+  const connectOptions = {
     useSSL: true,
     timeout: 6,
     keepAliveInterval: 30,
@@ -250,7 +274,7 @@ function initMQTT() {
       carRtt = null;
       brokerRtt = null;
       renderLatency();
-      console.log('[MQTT]: Connected successfully to HiveMQ Cloud!');
+      console.log(`[MQTT]: Connected successfully to ${state.mqttBroker}!`);
 
       // Subscribe to telemetry/status topic from car
       const statusTopic = `${state.mqttTopic}/status`;
@@ -270,7 +294,12 @@ function initMQTT() {
         setTimeout(initMQTT, 4000);
       }
     }
-  });
+  };
+  if (state.mqttUser) {
+    connectOptions.userName = state.mqttUser;
+    connectOptions.password = state.mqttPass;
+  }
+  mqttClient.connect(connectOptions);
 }
 
 // NETWORK TRANSMITTER
@@ -649,12 +678,17 @@ const inputMqttTopic = document.getElementById('input-mqtt-topic');
 const inputMqttBroker = document.getElementById('input-mqtt-broker');
 const groupMqttTopic = document.getElementById('group-mqtt-topic');
 const groupMqttBroker = document.getElementById('group-mqtt-broker');
+const groupMqttAuth = document.getElementById('group-mqtt-auth');
+const inputMqttPort = document.getElementById('input-mqtt-port');
+const inputMqttUser = document.getElementById('input-mqtt-user');
+const inputMqttPass = document.getElementById('input-mqtt-pass');
 const groupHttpIp = document.getElementById('group-http-ip');
 
 function updateModalVisibility() {
   const isMqtt = (selectConnMode.value === 'mqtt');
   if (groupMqttTopic) groupMqttTopic.style.display = isMqtt ? 'block' : 'none';
   if (groupMqttBroker) groupMqttBroker.style.display = isMqtt ? 'block' : 'none';
+  if (groupMqttAuth) groupMqttAuth.style.display = isMqtt ? 'block' : 'none';
   if (groupHttpIp) groupHttpIp.style.display = isMqtt ? 'none' : 'block';
 }
 
@@ -666,6 +700,9 @@ btnSettings.addEventListener('click', () => {
   if (selectConnMode) selectConnMode.value = state.connMode;
   if (inputMqttTopic) inputMqttTopic.value = state.mqttTopic;
   if (inputMqttBroker) inputMqttBroker.value = state.mqttBroker;
+  if (inputMqttPort) inputMqttPort.value = state.mqttPort;
+  if (inputMqttUser) inputMqttUser.value = state.mqttUser;
+  if (inputMqttPass) inputMqttPass.value = state.mqttPass;
   inputTargetIp.value = state.targetIp;
   inputPollRate.value = state.pollRate;
   checkHaptic.checked = state.hapticsEnabled;
@@ -682,7 +719,11 @@ btnSaveSettings.addEventListener('click', () => {
   const oldMode = state.connMode;
   if (selectConnMode) state.connMode = selectConnMode.value;
   if (inputMqttTopic) state.mqttTopic = inputMqttTopic.value.trim() || 'cyber_rc_car';
-  if (inputMqttBroker) state.mqttBroker = inputMqttBroker.value.trim() || 'broker.hivemq.com';
+  if (inputMqttBroker) state.mqttBroker = inputMqttBroker.value.trim() || 'n345137a.ala.asia-southeast1.emqxsl.com';
+  if (inputMqttPort) state.mqttPort = parseInt(inputMqttPort.value, 10) || 8084;
+  if (inputMqttUser) state.mqttUser = inputMqttUser.value.trim();
+  if (inputMqttPass) state.mqttPass = inputMqttPass.value;
+  saveBrokerSettings();
   state.targetIp = inputTargetIp.value.trim() || '192.168.4.1';
   state.pollRate = parseInt(inputPollRate.value, 10);
   state.hapticsEnabled = checkHaptic.checked;

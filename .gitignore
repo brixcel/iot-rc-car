@@ -7,3 +7,6 @@ desktop.ini
 *.hex
 *.elf
 *.bin
+
+# Local credentials
+NodeMCU_IoT_Bridge/secrets.h

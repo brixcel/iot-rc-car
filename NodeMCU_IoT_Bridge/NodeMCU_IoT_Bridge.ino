@@ -5,7 +5,7 @@
  * =====================================================================================
  * Target Board: NodeMCU 1.0 (ESP-12E Module) / ESP8266
  * Function:     1. Connects to Follower's Mobile Hotspot (4G/5G Cellular Internet)
- *               2. Connects to HiveMQ Cloud MQTT Broker via Internet
+ *               2. Connects to a Cloud MQTT Broker (TLS) via Internet
  *               3. Subscribes to commands published from 2nd Floor (or anywhere globally)
  *               4. Bridges commands to Arduino Uno via SoftwareSerial (Pins D1 & D2)
  *               5. Built-in Watchdog Failsafe (auto-stops car if internet signal drops)
@@ -23,6 +23,7 @@
  */
 
 #include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <SoftwareSerial.h>
 
@@ -30,15 +31,10 @@
 //                             CONFIGURATION SETTINGS
 // =====================================================================================
 
-// 1. FOLLOWER'S MOBILE HOTSPOT CREDENTIALS
-// Enter the exact Hotspot name and password of the phone following the RC car
-const char* WIFI_SSID = "Redmi 9T";
-const char* WIFI_PASS = "brexcel14";
-
-// 2. MQTT CLOUD BROKER SETTINGS
-// Free public HiveMQ broker (No account or API key required!)
-const char* MQTT_BROKER = "broker.hivemq.com";
-const int   MQTT_PORT   = 1883; // Standard unencrypted MQTT TCP port
+// 1 & 2. HOTSPOT + MQTT BROKER CREDENTIALS
+// Kept in secrets.h (git-ignored) so passwords never get pushed to GitHub.
+// First time: copy secrets.example.h to secrets.h and fill it in.
+#include "secrets.h"
 
 // 3. UNIQUE TOPIC IDENTIFIER
 // Must match the Topic in your Web Cockpit settings (default: "cyber_rc_car")
@@ -52,8 +48,8 @@ const char* TOPIC_PONG   = "cyber_rc_car/pong";    // Echoes latency pings back 
 SoftwareSerial unoSerial(D2, D1); // D2 = RX (GPIO 4), D1 = TX (GPIO 5)
 const long UNO_BAUD = 38400; // Must match LINK_BAUD in Arduino_RC_Car.ino
 
-// Wi-Fi and MQTT Client instances
-WiFiClient espClient;
+// Wi-Fi and MQTT Client instances (TLS: EMQX Serverless only accepts port 8883)
+WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
 // Watchdog & Safety variables
@@ -104,6 +100,9 @@ void setup() {
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(256); // Ensure sufficient buffer for packets
   espClient.setNoDelay(true);    // Disable Nagle: send small packets (pongs) immediately
+  // Encrypts traffic but skips verifying the broker's certificate (no clock/CA bundle
+  // needed on the ESP8266). Fine for a school project; not for anything sensitive.
+  espClient.setInsecure();
 
   // Send initial stop command to Arduino
   unoSerial.println("S:0");
@@ -211,14 +210,14 @@ void setupWiFi() {
 
 // --- MQTT CLOUD RECONNECT HANDLER ---
 boolean reconnectMQTT() {
-  Serial.print(F("[MQTT]: Connecting to HiveMQ Cloud Broker ("));
+  Serial.print(F("[MQTT]: Connecting to Cloud Broker ("));
   Serial.print(MQTT_BROKER);
   Serial.print(F(")... "));
 
   // Generate a unique Client ID based on NodeMCU Chip ID
   String clientId = "CYBER_RC_NODE_" + String(ESP.getChipId(), HEX);
 
-  if (mqttClient.connect(clientId.c_str())) {
+  if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
     Serial.println(F("CONNECTED!"));
     
     // Subscribe to the command topic

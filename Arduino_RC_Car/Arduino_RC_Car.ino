@@ -26,7 +26,7 @@
  *   Arduino Pin 11      --->  Buzzer / Horn (+) (Optional)
  *   Arduino Pin 12      --->  Front LED Headlights (+) (Optional)
  * 
- * Note: Hardware Serial (Pins 0 & 1) is kept FREE for USB debugging at 9600 baud!
+ * Note: Hardware Serial (Pins 0 & 1) is kept FREE for USB debugging at 115200 baud!
  * =====================================================================================
  */
 
@@ -48,25 +48,38 @@ const int PIN_ENB = -1;  // -1 for jumpered ENB
 const int PIN_BUZZER = A0; // Horn / Buzzer (Optional)
 const int PIN_LIGHTS = A1; // Headlights LED (Optional)
 
+// --- LINK SPEED ---
+// Must match UNO_BAUD in NodeMCU_IoT_Bridge.ino
+const long LINK_BAUD = 38400;
+
 // --- STATE VARIABLES ---
 int currentSpeed = 200;            // Default speed (0 - 255)
 unsigned long lastCommandTime = 0; // For failsafe auto-stop
-const unsigned long FAILSAFE_TIMEOUT_MS = 1800; // Auto-stop after 1.8s of no signal
+// NodeMCU re-sends the active command every 100ms, so 500ms of silence means
+// the NodeMCU crashed/reset (e.g. brownout) -> stop immediately.
+const unsigned long FAILSAFE_TIMEOUT_MS = 500;
+const unsigned long USB_FAILSAFE_TIMEOUT_MS = 3000; // Manual Serial Monitor tests
+unsigned long failsafeTimeout = FAILSAFE_TIMEOUT_MS;
 bool isMoving = false;
+String lastCmdLogged = "";
 
-// Serial reception buffer
-String rxBuffer = "";
+// Serial reception buffers (separate so USB and NodeMCU bytes never mix)
+String nodeBuffer = "";
+String usbBuffer = "";
+const unsigned int MAX_CMD_LEN = 32;
 
 void setup() {
   // Initialize Hardware USB Serial for PC debugging
-  Serial.begin(9600);
+  Serial.begin(115200);
   Serial.println(F("========================================"));
   Serial.println(F("   CYBER-RC // ARDUINO UNO READY        "));
   Serial.println(F("   Listening to NodeMCU on Pins 2 & 3   "));
   Serial.println(F("========================================"));
 
   // Initialize SoftwareSerial for NodeMCU link
-  nodeSerial.begin(9600);
+  nodeSerial.begin(LINK_BAUD);
+  nodeBuffer.reserve(MAX_CMD_LEN);
+  usbBuffer.reserve(MAX_CMD_LEN);
 
   // Configure Motor Pins
   if (PIN_ENA != -1) pinMode(PIN_ENA, OUTPUT);
@@ -103,22 +116,19 @@ void setup() {
 
 void loop() {
   // 1. Read incoming commands from NodeMCU via SoftwareSerial
+  // (No per-byte debug printing here: it blocked the loop and caused dropped commands)
   while (nodeSerial.available() > 0) {
     char c = (char)nodeSerial.read();
-    // Debug echo: show exact bytes arriving from NodeMCU
-    Serial.print(F("[LINK RX]: '"));
-    Serial.print(c);
-    Serial.print(F("' (0x"));
-    Serial.print((byte)c, HEX);
-    Serial.println(F(")"));
-
     if (c == '\n' || c == '\r') {
-      if (rxBuffer.length() > 0) {
-        processCommand(rxBuffer);
-        rxBuffer = "";
+      if (nodeBuffer.length() > 0) {
+        failsafeTimeout = FAILSAFE_TIMEOUT_MS;
+        processCommand(nodeBuffer);
+        nodeBuffer = "";
       }
+    } else if (nodeBuffer.length() < MAX_CMD_LEN) {
+      nodeBuffer += c;
     } else {
-      rxBuffer += c;
+      nodeBuffer = ""; // Garbage / overflow: drop it, next refresh will resync
     }
   }
 
@@ -126,19 +136,20 @@ void loop() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
-      if (rxBuffer.length() > 0) {
+      if (usbBuffer.length() > 0) {
         Serial.print(F("[USB TEST]: "));
-        Serial.println(rxBuffer);
-        processCommand(rxBuffer);
-        rxBuffer = "";
+        Serial.println(usbBuffer);
+        failsafeTimeout = USB_FAILSAFE_TIMEOUT_MS;
+        processCommand(usbBuffer);
+        usbBuffer = "";
       }
-    } else {
-      rxBuffer += c;
+    } else if (usbBuffer.length() < MAX_CMD_LEN) {
+      usbBuffer += c;
     }
   }
 
   // 3. Failsafe Watchdog: Auto-stop if signal lost
-  if (isMoving && (millis() - lastCommandTime > FAILSAFE_TIMEOUT_MS)) {
+  if (isMoving && (millis() - lastCommandTime > failsafeTimeout)) {
     Serial.println(F("[FAILSAFE]: Signal timed out! Emergency stop triggered."));
     stopMotors();
   }
@@ -180,11 +191,12 @@ void processCommand(String cmdStr) {
     spd = constrain(spd, 0, 255);
   }
 
-  // Debug output to PC Serial
-  Serial.print(F("CMD: "));
-  Serial.print(action);
-  Serial.print(F(" | SPD: "));
-  Serial.println(spd);
+  // Debug output to PC Serial (only on change: the NodeMCU repeats commands every 100ms)
+  if (cmdStr != lastCmdLogged) {
+    lastCmdLogged = cmdStr;
+    Serial.print(F("CMD: "));
+    Serial.println(cmdStr);
+  }
 
   if (action == "F") {
     moveForward(spd);

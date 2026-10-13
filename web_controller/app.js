@@ -161,6 +161,11 @@ function updateGauge(speedValue, gearName) {
 let mqttClient = null;
 let mqttConnected = false;
 
+// LATENCY PROBE: id -> performance.now() when the PING was sent
+const pendingPings = new Map();
+let pingSeq = 0;
+let lastPongTime = 0;
+
 function initMQTT() {
   if (typeof Paho === 'undefined') {
     console.warn('[MQTT]: Paho library not yet loaded, retrying in 500ms...');
@@ -200,9 +205,14 @@ function initMQTT() {
       connText.textContent = 'CAR ONLINE';
       connBadge.style.color = '#00ff88';
       state.isConnected = true;
-      if (state.lastSendTime > 0) {
-        const roundTrip = Math.max(12, Math.round(Date.now() - state.lastSendTime));
-        pingVal.textContent = `${roundTrip} ms`;
+    } else if (topic.endsWith('/pong')) {
+      // Real round trip: cockpit -> broker -> car -> broker -> cockpit
+      const sentAt = pendingPings.get(payload);
+      if (sentAt !== undefined) {
+        pendingPings.delete(payload);
+        lastPongTime = performance.now();
+        pingVal.textContent = `${Math.round(lastPongTime - sentAt)} ms`;
+        state.isConnected = true;
       }
     }
   };
@@ -223,7 +233,8 @@ function initMQTT() {
       // Subscribe to telemetry/status topic from car
       const statusTopic = `${state.mqttTopic}/status`;
       mqttClient.subscribe(statusTopic);
-      console.log(`[MQTT]: Subscribed to ${statusTopic}`);
+      mqttClient.subscribe(`${state.mqttTopic}/pong`);
+      console.log(`[MQTT]: Subscribed to ${statusTopic} and /pong`);
     },
     onFailure: (err) => {
       mqttConnected = false;
@@ -456,6 +467,9 @@ const keyMap = {
   ' ': 'btn-stop', 'Escape': 'btn-stop'
 };
 
+// Block the long-press context menu on phones (it can cancel a held button)
+window.addEventListener('contextmenu', (e) => e.preventDefault());
+
 const activeKeys = new Set();
 window.addEventListener('keydown', (e) => {
   if (e.repeat) return;
@@ -499,6 +513,11 @@ modeJoyBtn.addEventListener('click', () => {
 let joyActive = false;
 let joyCenter = { x: 0, y: 0 };
 const maxRadius = 60; // Max distance knob can travel from center
+const JOY_MIN_INTERVAL = 60; // ms between joystick sends
+let joyLatest = null;
+let joyLastSent = null;
+let joyLastSendTime = 0;
+let joyStreamTimer = null;
 
 function initJoystickCenter() {
   const rect = joystickBase.getBoundingClientRect();
@@ -534,8 +553,19 @@ function handleJoystickMove(touchX, touchY) {
   const joySpeed = Math.round((powerPercent / 100) * state.currentSpeed);
   updateGauge(joySpeed, getGearFromVector(normX, normY));
 
-  // Send vector to NodeMCU
-  sendCarCommand('V', joySpeed, { x: normX, y: normY });
+  // Send vector to NodeMCU (throttled: pointermove fires 60+ times/sec)
+  const changed = !joyLastSent || joyLastSent.x !== normX || joyLastSent.y !== normY || joyLastSent.spd !== joySpeed;
+  joyLatest = { x: normX, y: normY, spd: joySpeed };
+  if (changed && performance.now() - joyLastSendTime >= JOY_MIN_INTERVAL) {
+    sendJoyVector();
+  }
+}
+
+function sendJoyVector() {
+  if (!joyLatest) return;
+  joyLastSendTime = performance.now();
+  joyLastSent = joyLatest;
+  sendCarCommand('V', joyLatest.spd, { x: joyLatest.x, y: joyLatest.y });
 }
 
 function getGearFromVector(x, y) {
@@ -555,6 +585,10 @@ function getGearFromVector(x, y) {
 
 function handleJoystickEnd() {
   joyActive = false;
+  clearInterval(joyStreamTimer);
+  joyStreamTimer = null;
+  joyLatest = null;
+  joyLastSent = null;
   joystickKnob.style.transform = `translate(0px, 0px)`;
   joyAngleEl.textContent = '0°';
   joyDistEl.textContent = '0%';
@@ -566,6 +600,11 @@ joystickBase.addEventListener('pointerdown', (e) => {
   joyActive = true;
   initJoystickCenter();
   handleJoystickMove(e.clientX, e.clientY);
+
+  // Keep-alive: holding the stick still fires no pointermove, so keep streaming
+  // the latest vector or the car's watchdog would stop it
+  clearInterval(joyStreamTimer);
+  joyStreamTimer = setInterval(sendJoyVector, state.pollRate);
 });
 
 window.addEventListener('pointermove', (e) => {
@@ -638,6 +677,29 @@ btnSaveSettings.addEventListener('click', () => {
     connBadge.style.color = '#00f2fe';
   }
 });
+
+// PERIODIC MQTT LATENCY PING (car echoes it on /pong)
+setInterval(() => {
+  if (state.connMode !== 'mqtt' || !mqttClient || !mqttConnected) return;
+
+  // Drop pings that never came back
+  const now = performance.now();
+  for (const [id, sentAt] of pendingPings) {
+    if (now - sentAt > 5000) pendingPings.delete(id);
+  }
+  if (lastPongTime > 0 && now - lastPongTime > 5000) {
+    pingVal.textContent = 'NO CAR';
+  }
+
+  const id = String(++pingSeq);
+  try {
+    const message = new Paho.MQTT.Message(`PING:${id}`);
+    message.destinationName = `${state.mqttTopic}/cmd`;
+    message.qos = 0;
+    pendingPings.set(id, now);
+    mqttClient.send(message);
+  } catch (e) {}
+}, 1000);
 
 // PERIODIC HTTP HEARTBEAT / PING (Only active in HTTP mode)
 setInterval(async () => {

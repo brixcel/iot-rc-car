@@ -44,11 +44,13 @@ const int   MQTT_PORT   = 1883; // Standard unencrypted MQTT TCP port
 // Must match the Topic in your Web Cockpit settings (default: "cyber_rc_car")
 const char* TOPIC_CMD    = "cyber_rc_car/cmd";     // Receives driving commands
 const char* TOPIC_STATUS = "cyber_rc_car/status";  // Sends telemetry to cockpit
+const char* TOPIC_PONG   = "cyber_rc_car/pong";    // Echoes latency pings back to cockpit
 
 // =====================================================================================
 
 // SoftwareSerial communication to Arduino Uno (RX=D2, TX=D1)
 SoftwareSerial unoSerial(D2, D1); // D2 = RX (GPIO 4), D1 = TX (GPIO 5)
+const long UNO_BAUD = 38400; // Must match LINK_BAUD in Arduino_RC_Car.ino
 
 // Wi-Fi and MQTT Client instances
 WiFiClient espClient;
@@ -57,7 +59,13 @@ PubSubClient mqttClient(espClient);
 // Watchdog & Safety variables
 unsigned long lastCommandTime = 0;
 bool carIsActive = false;
-const unsigned long AUTO_STOP_TIMEOUT = 1500; // ms: Stops car if no command within 1.5s
+const unsigned long AUTO_STOP_TIMEOUT = 1200; // ms: Stops car if no command within 1.2s
+
+// Active drive command, re-sent to the Uno every 100ms so a dropped serial byte
+// is corrected on the next refresh and the Uno's 500ms failsafe never fires mid-drive
+char driveCmd[32] = "S:0";
+unsigned long lastRefreshTime = 0;
+const unsigned long REFRESH_INTERVAL = 100;
 
 // Non-blocking reconnect timers
 unsigned long lastReconnectAttempt = 0;
@@ -84,9 +92,9 @@ void setup() {
   pinMode(PIN_LED, OUTPUT);
   digitalWrite(PIN_LED, HIGH); // Turn LED off initially
 
-  // Initialize SoftwareSerial to Arduino Uno at 9600 baud
-  unoSerial.begin(9600);
-  Serial.println(F("[SERIAL]: SoftwareSerial active on D1(TX)->Uno(2) and D2(RX)->Uno(3) at 9600 baud"));
+  // Initialize SoftwareSerial to Arduino Uno
+  unoSerial.begin(UNO_BAUD);
+  Serial.println(F("[SERIAL]: SoftwareSerial active on D1(TX)->Uno(2) and D2(RX)->Uno(3) at 38400 baud"));
 
   // Connect to Follower's Mobile Hotspot with robust reconnection settings
   setupWiFi();
@@ -95,6 +103,7 @@ void setup() {
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(256); // Ensure sufficient buffer for packets
+  espClient.setNoDelay(true);    // Disable Nagle: send small packets (pongs) immediately
 
   // Send initial stop command to Arduino
   unoSerial.println("S:0");
@@ -103,6 +112,21 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  // 0. Watchdog Failsafe: Auto-stop car if the command stream stopped while moving.
+  //    Runs before the Wi-Fi check so it still fires when Wi-Fi drops.
+  if (carIsActive && (now - lastCommandTime > AUTO_STOP_TIMEOUT)) {
+    Serial.println(F("[WATCHDOG]: Command stream timeout! Stopping RC Car."));
+    strcpy(driveCmd, "S:0");
+    unoSerial.println(driveCmd);
+    carIsActive = false;
+  }
+
+  // 0b. Refresh the active drive command to the Uno
+  if (now - lastRefreshTime >= REFRESH_INTERVAL) {
+    lastRefreshTime = now;
+    unoSerial.println(driveCmd);
+  }
 
   // 1. Maintain Wi-Fi Connection (Smooth background auto-reconnect)
   if (WiFi.status() != WL_CONNECTED) {
@@ -134,14 +158,7 @@ void loop() {
     digitalWrite(PIN_LED, LOW); // Solid blue LED = 100% HEALTHY CLOUD LINK
   }
 
-  // 3. Watchdog Failsafe: Auto-stop car if signal was lost while moving
-  if (carIsActive && (now - lastCommandTime > AUTO_STOP_TIMEOUT)) {
-    Serial.println(F("[WATCHDOG]: Command stream timeout! Stopping RC Car."));
-    unoSerial.println("S:0");
-    carIsActive = false;
-  }
-
-  // 4. Send Periodic Telemetry/Heartbeat to Cloud (Every 3 seconds)
+  // 3. Send Periodic Telemetry/Heartbeat to Cloud (Every 3 seconds)
   if (now - lastTelemetryTime > 3000) {
     lastTelemetryTime = now;
     if (mqttClient.connected()) {
@@ -150,7 +167,7 @@ void loop() {
     }
   }
 
-  // 5. Forward any telemetry/log messages from Arduino Uno to PC Serial Monitor
+  // 4. Forward any telemetry/log messages from Arduino Uno to PC Serial Monitor
   while (unoSerial.available() > 0) {
     char c = (char)unoSerial.read();
     Serial.write(c);
@@ -228,16 +245,30 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   memcpy(msg, payload, length);
   msg[length] = '\0';
 
-  // Debug log on USB Serial Monitor
-  Serial.print(F("[MQTT -> UNO]: "));
-  Serial.println(msg);
+  // Latency ping from the cockpit: echo it straight back, don't forward to the Uno
+  if (strncmp(msg, "PING:", 5) == 0) {
+    mqttClient.publish(TOPIC_PONG, msg + 5);
+    return;
+  }
 
   // Send packet directly to Arduino Uno via SoftwareSerial!
   // e.g., "F:200\n", "S:0\n", "V:100:0:200\n", "LIGHT:1\n", "HORN:1\n"
   unoSerial.println(msg);
-  unoSerial.flush();
 
+  // Lights/horn are one-shot: don't let them replace the active drive command
+  if (strncmp(msg, "LIGHT", 5) == 0 || strncmp(msg, "HORN", 4) == 0) {
+    return;
+  }
+
+  // Debug log on USB Serial Monitor (only when the drive command changes)
+  if (strcmp(msg, driveCmd) != 0) {
+    Serial.print(F("[MQTT -> UNO]: "));
+    Serial.println(msg);
+  }
+
+  strncpy(driveCmd, msg, sizeof(driveCmd) - 1);
+  driveCmd[sizeof(driveCmd) - 1] = '\0';
   lastCommandTime = millis();
-  // If direction is not Stop ('S'), mark car as actively moving
-  carIsActive = (msg[0] != 'S');
+  // Stop is exactly "S" / "S:<n>"; "SL"/"SR" are spins and count as moving
+  carIsActive = !(msg[0] == 'S' && (msg[1] == ':' || msg[1] == '\0'));
 }
